@@ -1,0 +1,1957 @@
+
+/* =========================================
+   SEEDSHOP - MAIN JAVASCRIPT
+   ========================================= */
+   
+/* =========================================
+   SUPABASE CONNECTION
+   ========================================= */
+
+const SUPABASE_URL = "https://bqndrsfanhwtbyzjguen.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_XTTQFnaWbS6nGq2T0SkoDw_badyLowF";
+
+const supabaseClient = window.supabase.createClient(
+  SUPABASE_URL,
+  SUPABASE_PUBLISHABLE_KEY
+);
+
+// ตะกร้าสินค้าเก็บในเบราว์เซอร์ (ข้อมูลอื่นอยู่ใน Supabase)
+const DB = { cart: "seedshop_cart" };
+
+const $ = id => document.getElementById(id);
+
+const read = (key, fallback = []) => {
+  try {
+    return JSON.parse(localStorage.getItem(key)) ?? fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const save = (key, value) =>
+  localStorage.setItem(key, JSON.stringify(value));
+
+let currentUser = null;
+let currentPage = "home";
+let selectedCategory = "ทั้งหมด";
+let authMode = "login";
+let selectedChat = null;
+let searchText = "";
+
+/* ---------- แคชข้อมูลจาก Supabase ---------- */
+const cache = { users: [], products: [], orders: [], messages: [] };
+
+const fromProfile = r => ({
+  id: r.id, name: r.name, email: r.email, role: r.role,
+  phone: r.phone || "", address: r.address || "",
+  subdistrict: r.subdistrict || "", district: r.district || "",
+  province: r.province || "", postcode: r.postcode || "",
+  bank: r.bank || "", bankAccount: r.bank_account || "",
+  promptPay: r.prompt_pay || "", qrImage: r.qr_image || ""
+});
+
+const toProfile = u => ({
+  id: u.id, name: u.name, email: u.email, role: u.role,
+  phone: u.phone, address: u.address, subdistrict: u.subdistrict,
+  district: u.district, province: u.province, postcode: u.postcode,
+  bank: u.bank, bank_account: u.bankAccount,
+  prompt_pay: u.promptPay, qr_image: u.qrImage
+});
+
+const fromProduct = r => ({
+  id: r.id, name: r.name, category: r.category,
+  price: Number(r.price), stock: r.stock,
+  description: r.description || "", image: r.image,
+  sellerId: r.seller_id, sellerName: r.seller_name
+});
+
+const toProduct = p => ({
+  id: p.id, name: p.name, category: p.category, price: p.price,
+  stock: p.stock, description: p.description, image: p.image,
+  seller_id: p.sellerId, seller_name: p.sellerName
+});
+
+const fromOrder = r => ({
+  id: r.id, customerId: r.customer_id, sellerId: r.seller_id,
+  customerName: r.customer_name, items: r.items, address: r.address,
+  payment: r.payment, paymentName: r.payment_name,
+  total: Number(r.total), status: r.status,
+  paymentStatus: r.payment_status, date: r.date
+});
+
+const toOrder = o => ({
+  id: o.id, customer_id: o.customerId, seller_id: o.sellerId,
+  customer_name: o.customerName, items: o.items, address: o.address,
+  payment: o.payment, payment_name: o.paymentName, total: o.total,
+  status: o.status, payment_status: o.paymentStatus, date: o.date
+});
+
+async function loadAll() {
+  const [users, products, orders, messages] = await Promise.all([
+    supabaseClient.from("profiles").select("*"),
+    supabaseClient.from("products").select("*"),
+    supabaseClient.from("orders").select("*").order("date", { ascending: false }),
+    supabaseClient.from("messages").select("*").order("date")
+  ]);
+
+  const failed = [users, products, orders, messages].find(r => r.error);
+  if (failed) {
+    console.error(failed.error);
+    toast("โหลดข้อมูลไม่สำเร็จ: " + failed.error.message);
+    return;
+  }
+
+  cache.users = users.data.map(fromProfile);
+  cache.products = products.data.map(fromProduct);
+  cache.orders = orders.data.map(fromOrder);
+  cache.messages = messages.data;
+}
+
+// รัน query ที่ไม่ต้องใช้ผลลัพธ์ แล้วแจ้งเตือนถ้าผิดพลาด
+async function dbOk(query, label = "บันทึกไม่สำเร็จ") {
+  const { error } = await query;
+  if (error) {
+    console.error(error);
+    toast(label + ": " + error.message);
+    return false;
+  }
+  return true;
+}
+
+let chatChannel = null;
+
+function subscribeChat() {
+  if (chatChannel) supabaseClient.removeChannel(chatChannel);
+  chatChannel = null;
+  if (!currentUser) return;
+
+  chatChannel = supabaseClient
+    .channel("messages-" + currentUser.id)
+    .on("postgres_changes",
+      { event: "INSERT", schema: "public", table: "messages" },
+      payload => {
+        const m = payload.new;
+        if (m.sender_id !== currentUser.id && m.receiver_id !== currentUser.id) return;
+        if (!cache.messages.some(x => x.id === m.id)) cache.messages.push(m);
+        if (currentPage === "chat") renderChatMessages();
+      })
+    .subscribe();
+}
+
+
+const categories = [
+  { name: "ทั้งหมด", icon: "fa-border-all" },
+  { name: "ผักสวนครัว", icon: "fa-carrot" },
+  { name: "ผลไม้", icon: "fa-apple-whole" },
+  { name: "ดอกไม้", icon: "fa-spa" },
+  { name: "พืชไร่", icon: "fa-wheat-awn" },
+  { name: "สมุนไพร", icon: "fa-leaf" }
+];
+
+
+function uid(prefix = "ID") {
+  return prefix + Date.now().toString().slice(-8) +
+    Math.floor(Math.random() * 1000);
+}
+
+function money(value) {
+  return Number(value).toLocaleString("th-TH") + " ฿";
+}
+
+function escapeHTML(value = "") {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;"
+  })[char]);
+}
+
+function getUsers() {
+  return cache.users;
+}
+
+function getProducts() {
+  return cache.products;
+}
+
+function getOrders() {
+  return cache.orders;
+}
+
+function getCart() {
+  return read(DB.cart, []);
+}
+
+// รวมข้อความเป็นห้องแชตตามคู่สนทนา
+function getChats() {
+  const chats = {};
+  cache.messages.forEach(m => {
+    const id = getChatId(m.sender_id, m.receiver_id);
+    chats[id] = chats[id] || {
+      id, members: [m.sender_id, m.receiver_id], messages: []
+    };
+    chats[id].messages.push({
+      senderId: m.sender_id, message: m.message, date: m.date
+    });
+  });
+  return Object.values(chats);
+}
+
+function getUserById(id) {
+  return getUsers().find(user => user.id === id);
+}
+
+function isSeller() {
+  return currentUser && currentUser.role === "seller";
+}
+
+function requireLogin() {
+  if (!currentUser) {
+    showPage("auth");
+    toast("กรุณาเข้าสู่ระบบก่อน");
+    return false;
+  }
+  return true;
+}
+
+function toast(message) {
+  const box = $("toast");
+  box.textContent = message;
+  box.classList.add("show");
+
+  clearTimeout(window.toastTimer);
+  window.toastTimer = setTimeout(() => {
+    box.classList.remove("show");
+  }, 2500);
+}
+
+function updateNavbar() {
+  const cartCount = getCart().reduce(
+    (sum, item) => sum + item.quantity, 0
+  );
+
+  $("cartCount").textContent = cartCount;
+  $("loginNav").classList.toggle("hidden", !!currentUser);
+  $("logoutNav").classList.toggle("hidden", !currentUser);
+}
+
+function showPage(page) {
+  if (page === "seller" && !isSeller()) {
+    toast("เฉพาะบัญชีผู้ขายเท่านั้น");
+    return;
+  }
+
+  if (["cart", "checkout", "orders", "profile", "chat"].includes(page)
+      && !requireLogin()) return;
+
+  currentPage = page;
+
+  const pages = {
+    home: renderHome,
+    auth: renderAuth,
+    cart: renderCart,
+    checkout: renderCheckout,
+    orders: renderOrders,
+    profile: renderProfile,
+    chat: renderChat,
+    seller: renderSeller
+  };
+
+  (pages[page] || renderHome)();
+  updateNavbar();
+
+  // ดึงข้อมูลล่าสุด (เช่น ออเดอร์ใหม่) แล้ววาดหน้าซ้ำ
+  if (currentUser && ["orders", "seller"].includes(page)) {
+    loadAll().then(() => {
+      if (currentPage === page && !document.querySelector("#productForm")) {
+        pages[page]();
+      }
+    });
+  }
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function logout() {
+  if (!currentUser) return;
+
+  currentUser = null;
+  supabaseClient.auth.signOut();
+  subscribeChat();
+  cache.orders = [];
+  cache.messages = [];
+  save(DB.cart, []);
+  selectedChat = null;
+
+  updateNavbar();
+  showPage("home");
+  toast("ออกจากระบบเรียบร้อย");
+}
+
+/* =========================================
+   HOME AND PRODUCTS
+   ========================================= */
+
+function renderHome() {
+  const products = getProducts().filter(product => {
+    const categoryMatch =
+      selectedCategory === "ทั้งหมด" ||
+      product.category === selectedCategory;
+
+    const searchMatch =
+      (product.name + " " + product.category + " " +
+       product.description).toLowerCase()
+      .includes(searchText.toLowerCase());
+
+    return categoryMatch && searchMatch;
+  });
+
+  $("app").innerHTML = `
+    <section class="hero">
+      <div class="hero-content">
+        <span class="hero-tag">
+          <i class="fa-solid fa-leaf"></i>
+          SEEDSHOP MARKETPLACE
+        </span>
+        <h1>เมล็ดพันธุ์คุณภาพ<br>เพื่อการเกษตรที่ยั่งยืน</h1>
+        <p>เลือกซื้อเมล็ดพันธุ์จากร้านค้าหลากหลาย<br>
+        ค้นหาสินค้าที่ใช่ แล้วเริ่มต้นปลูกไปด้วยกัน</p>
+        <button class="primary-btn" onclick="scrollProducts()">
+          เลือกซื้อสินค้า <i class="fa-solid fa-arrow-right"></i>
+        </button>
+      </div>
+    </section>
+
+    <div class="section-heading">
+      <div>
+        <h2>เลือกหมวดหมู่เมล็ดพันธุ์</h2>
+        <p>ค้นหาสินค้าที่คุณสนใจได้ง่าย ๆ</p>
+      </div>
+    </div>
+
+    <div class="category-grid">
+      ${categories.map(cat => `
+        <button class="category-item ${selectedCategory === cat.name ? "active" : ""}"
+          onclick="filterCategory('${cat.name}')">
+          <i class="fa-solid ${cat.icon}"></i>
+          <span>${cat.name}</span>
+        </button>
+      `).join("")}
+    </div>
+
+    <div class="section-heading" id="productsSection">
+      <div>
+        <h2>เมล็ดพันธุ์แนะนำ 🌱</h2>
+        <p>เลือกสินค้าที่เหมาะกับสวนของคุณ</p>
+      </div>
+      <span>${products.length} รายการ</span>
+    </div>
+
+    <div class="product-grid">
+      ${products.length ? products.map(productCard).join("") :
+        `<div class="empty-state" style="grid-column:1/-1">
+          <i class="fa-solid fa-seedling"></i>
+          <h3>ไม่พบสินค้า</h3>
+          <p>ลองค้นหาด้วยคำอื่นหรือเปลี่ยนหมวดหมู่</p>
+        </div>`}
+    </div>
+
+    ${!currentUser ? `
+      <section class="panel" style="margin-top:35px;text-align:center;background:#eaf5e7">
+        <h2 style="color:var(--green)">มีเมล็ดพันธุ์อยากขายไหม?</h2>
+        <p style="margin:10px 0 18px;font-size:13px">
+          สมัครเป็นผู้ขายกับ SeedShop และเริ่มต้นร้านค้าของคุณ
+        </p>
+        <button class="primary-btn" onclick="showPage('auth')">
+          สมัครสมาชิกเลย
+        </button>
+      </section>` : ""}
+  `;
+}
+
+function productCard(product) {
+  return `
+    <article class="product-card">
+      <img class="product-image"
+        src="${escapeHTML(product.image)}"
+        alt="${escapeHTML(product.name)}"
+        onerror="this.src='https://placehold.co/600x400/e8f5e8/176b43?text=SeedShop'">
+
+      <div class="product-info">
+        <span class="product-category">
+          ${escapeHTML(product.category)}
+        </span>
+        <h3>${escapeHTML(product.name)}</h3>
+        <p class="product-description">
+          ${escapeHTML(product.description)}
+        </p>
+        <div class="product-price">
+          ${money(product.price)}
+          <small>/ แพ็ก</small>
+        </div>
+        <div class="product-meta">
+          <span><i class="fa-solid fa-box"></i> เหลือ ${product.stock}</span>
+          <span><i class="fa-solid fa-store"></i>
+            ${escapeHTML(product.sellerName || "ร้านค้า")}
+          </span>
+        </div>
+        <div class="product-actions">
+          <button class="secondary-btn"
+            onclick="viewProduct('${product.id}')">
+            รายละเอียด
+          </button>
+          <button class="primary-btn"
+            onclick="addToCart('${product.id}')"
+            ${product.stock <= 0 ? "disabled" : ""}>
+            <i class="fa-solid fa-cart-plus"></i>
+            ซื้อ
+          </button>
+        </div>
+        ${currentUser && currentUser.role === "customer" ?
+          `<button class="secondary-btn full-btn"
+            style="margin-top:8px"
+            onclick="startChat('${product.sellerId}')">
+            <i class="fa-regular fa-comment"></i> ติดต่อผู้ขาย
+          </button>` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function filterCategory(category) {
+  selectedCategory = category;
+  renderHome();
+}
+
+function scrollProducts() {
+  $("productsSection")?.scrollIntoView({ behavior: "smooth" });
+}
+
+function viewProduct(id) {
+  const product = getProducts().find(p => p.id === id);
+  if (!product) return;
+
+  $("app").innerHTML = `
+    <div class="page-title">
+      <h1>รายละเอียดสินค้า</h1>
+      <p>ข้อมูลเมล็ดพันธุ์ที่คุณเลือก</p>
+    </div>
+    <div class="panel" style="display:grid;grid-template-columns:1fr 1fr;gap:25px">
+      <img src="${escapeHTML(product.image)}"
+        style="width:100%;height:320px;object-fit:cover;border-radius:14px"
+        onerror="this.src='https://placehold.co/600x400'">
+      <div>
+        <span class="product-category">${escapeHTML(product.category)}</span>
+        <h2>${escapeHTML(product.name)}</h2>
+        <p style="color:var(--muted);margin:15px 0;font-size:13px">
+          ${escapeHTML(product.description)}
+        </p>
+        <div class="product-price">${money(product.price)}</div>
+        <p style="font-size:12px;margin:10px 0">
+          คงเหลือ ${product.stock} แพ็ก
+        </p>
+        <p style="font-size:12px;margin-bottom:20px">
+          ผู้ขาย: ${escapeHTML(product.sellerName)}
+        </p>
+        <button class="primary-btn" onclick="addToCart('${product.id}')">
+          <i class="fa-solid fa-cart-plus"></i> เพิ่มลงตะกร้า
+        </button>
+        ${currentUser?.role === "customer" ? `
+          <button class="secondary-btn"
+            onclick="startChat('${product.sellerId}')">
+            ติดต่อผู้ขาย
+          </button>` : ""}
+        <button class="secondary-btn" onclick="showPage('home')">
+          กลับหน้าสินค้า
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+/* =========================================
+   CART
+   ========================================= */
+
+function addToCart(productId) {
+  if (!requireLogin()) return;
+
+  if (currentUser.role !== "customer") {
+    toast("บัญชีผู้ขายไม่สามารถสั่งซื้อสินค้าได้");
+    return;
+  }
+
+  const products = getProducts();
+  const product = products.find(p => p.id === productId);
+
+  if (!product || product.stock <= 0) {
+    toast("สินค้าหมด");
+    return;
+  }
+
+  const cart = getCart();
+  const existing = cart.find(item =>
+    item.productId === productId &&
+    item.sellerId === product.sellerId
+  );
+
+  if (existing) {
+    if (existing.quantity >= product.stock) {
+      toast("สินค้าในสต็อกไม่เพียงพอ");
+      return;
+    }
+    existing.quantity++;
+  } else {
+    cart.push({
+      productId,
+      sellerId: product.sellerId,
+      quantity: 1
+    });
+  }
+
+  save(DB.cart, cart);
+  updateNavbar();
+  toast("เพิ่มสินค้าลงตะกร้าแล้ว");
+}
+
+function cartProducts() {
+  return getCart().map(item => {
+    const product = getProducts().find(p =>
+      p.id === item.productId &&
+      p.sellerId === item.sellerId
+    );
+    return product ? { ...item, product } : null;
+  }).filter(Boolean);
+}
+
+function changeQuantity(productId, delta) {
+  const cart = getCart();
+  const item = cart.find(i => i.productId === productId);
+  const product = getProducts().find(p => p.id === productId);
+
+  if (!item || !product) return;
+
+  item.quantity += delta;
+
+  if (item.quantity <= 0) {
+    save(DB.cart, cart.filter(i => i.productId !== productId));
+  } else if (item.quantity > product.stock) {
+    item.quantity = product.stock;
+    toast("ไม่สามารถเพิ่มเกินจำนวนสินค้าได้");
+    save(DB.cart, cart);
+  } else {
+    save(DB.cart, cart);
+  }
+
+  renderCart();
+  updateNavbar();
+}
+
+function removeCartItem(productId) {
+  save(DB.cart, getCart().filter(i => i.productId !== productId));
+  renderCart();
+  updateNavbar();
+  toast("นำสินค้าออกจากตะกร้าแล้ว");
+}
+
+function renderCart() {
+  const items = cartProducts();
+  const total = items.reduce(
+    (sum, item) => sum + item.product.price * item.quantity, 0
+  );
+
+  $("app").innerHTML = `
+    <div class="page-title">
+      <h1><i class="fa-solid fa-cart-shopping"></i> ตะกร้าสินค้า</h1>
+      <p>ตรวจสอบรายการสินค้าก่อนสั่งซื้อ</p>
+    </div>
+
+    ${items.length ? `
+      <div class="cart-layout">
+        <div class="panel">
+          <h3>รายการสินค้าของคุณ (${items.length})</h3>
+          ${items.map(item => `
+            <div class="cart-item">
+              <img src="${escapeHTML(item.product.image)}">
+              <div class="cart-item-info">
+                <h4>${escapeHTML(item.product.name)}</h4>
+                <p>${money(item.product.price)}</p>
+                <div class="quantity-control">
+                  <button onclick="changeQuantity('${item.productId}',-1)">-</button>
+                  <span>${item.quantity}</span>
+                  <button onclick="changeQuantity('${item.productId}',1)">+</button>
+                </div>
+              </div>
+              <button class="danger-btn"
+                onclick="removeCartItem('${item.productId}')">
+                <i class="fa-solid fa-trash"></i>
+              </button>
+            </div>
+          `).join("")}
+        </div>
+        <div class="panel">
+          <h3>สรุปคำสั่งซื้อ</h3>
+          <div class="summary-row">
+            <span>จำนวนสินค้า</span><span>${items.length} รายการ</span>
+          </div>
+          <div class="summary-row">
+            <span>ยอดรวมสินค้า</span><span>${money(total)}</span>
+          </div>
+          <div class="summary-row">
+            <span>ค่าจัดส่ง</span><span>คำนวณตามร้านค้า</span>
+          </div>
+          <div class="summary-row summary-total">
+            <span>รวมสินค้า</span><span>${money(total)}</span>
+          </div>
+          <button class="primary-btn full-btn"
+            onclick="showPage('checkout')">
+            ดำเนินการสั่งซื้อ <i class="fa-solid fa-arrow-right"></i>
+          </button>
+        </div>
+      </div>
+    ` : `
+      <div class="empty-state">
+        <i class="fa-solid fa-basket-shopping"></i>
+        <h3>ยังไม่มีสินค้าในตะกร้า</h3>
+        <p>เลือกเมล็ดพันธุ์ที่คุณชื่นชอบได้เลย</p>
+        <button class="primary-btn" onclick="showPage('home')">
+          เลือกซื้อสินค้า
+        </button>
+      </div>
+    `}
+  `;
+}
+
+/* =========================================
+   CHECKOUT AND PAYMENT
+   ========================================= */
+
+function renderCheckout() {
+  const items = cartProducts();
+
+  if (!items.length) {
+    toast("กรุณาเพิ่มสินค้าลงตะกร้าก่อน");
+    showPage("cart");
+    return;
+  }
+
+  const total = items.reduce(
+    (sum, item) => sum + item.product.price * item.quantity, 0
+  );
+
+  const customer = currentUser;
+
+  $("app").innerHTML = `
+    <div class="page-title">
+      <h1><i class="fa-solid fa-file-invoice"></i> ยืนยันคำสั่งซื้อ</h1>
+      <p>กรอกข้อมูลจัดส่งและเลือกวิธีชำระเงิน</p>
+    </div>
+
+    <form id="checkoutForm">
+      <div class="checkout-layout">
+        <div>
+          <div class="panel">
+            <h3><i class="fa-solid fa-location-dot"></i> ที่อยู่จัดส่ง</h3>
+
+            <div class="form-grid">
+              <div class="form-group">
+                <label>ชื่อผู้รับสินค้า *</label>
+                <input name="recipient" required
+                  value="${escapeHTML(customer.name)}">
+              </div>
+              <div class="form-group">
+                <label>เบอร์โทรศัพท์ *</label>
+                <input name="phone" required
+                  type="tel" pattern="[0-9]{9,10}"
+                  value="${escapeHTML(customer.phone || "")}">
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>ที่อยู่จัดส่งโดยละเอียด *</label>
+              <textarea name="address" required
+                placeholder="บ้านเลขที่ หมู่บ้าน ถนน ซอย">${escapeHTML(customer.address || "")}</textarea>
+            </div>
+
+            <div class="form-grid">
+              <div class="form-group">
+                <label>ตำบล / แขวง *</label>
+                <input name="subdistrict" required
+                  value="${escapeHTML(customer.subdistrict || "")}">
+              </div>
+              <div class="form-group">
+                <label>อำเภอ / เขต *</label>
+                <input name="district" required
+                  value="${escapeHTML(customer.district || "")}">
+              </div>
+              <div class="form-group">
+                <label>จังหวัด *</label>
+                <input name="province" required
+                  value="${escapeHTML(customer.province || "")}">
+              </div>
+              <div class="form-group">
+                <label>รหัสไปรษณีย์ *</label>
+                <input name="postcode" required
+                  pattern="[0-9]{5}" maxlength="5"
+                  value="${escapeHTML(customer.postcode || "")}">
+              </div>
+            </div>
+
+            <label style="font-size:12px">
+              <input type="checkbox" name="saveAddress" checked>
+              บันทึกที่อยู่นี้ไว้ในโปรไฟล์ของฉัน
+            </label>
+          </div>
+
+          <div class="panel">
+            <h3><i class="fa-solid fa-credit-card"></i> เลือกวิธีชำระเงิน</h3>
+
+            <label class="payment-option">
+              <input type="radio" name="payment" value="cod" checked>
+              <i class="fa-solid fa-truck-fast"></i>
+              <span>
+                <strong>เก็บเงินปลายทาง (COD)</strong>
+                <small>ชำระเงินเมื่อได้รับสินค้า</small>
+              </span>
+            </label>
+
+            <label class="payment-option">
+              <input type="radio" name="payment" value="bank">
+              <i class="fa-solid fa-building-columns"></i>
+              <span>
+                <strong>โอนผ่านธนาคาร</strong>
+                <small>โอนเงินเข้าบัญชีผู้ขาย</small>
+              </span>
+            </label>
+
+            <label class="payment-option">
+              <input type="radio" name="payment" value="qr">
+              <i class="fa-solid fa-qrcode"></i>
+              <span>
+                <strong>ชำระผ่าน QR Code</strong>
+                <small>สแกน QR Code เพื่อชำระเงิน</small>
+              </span>
+            </label>
+
+            <div id="paymentInfo"></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel">
+            <h3>สรุปรายการสั่งซื้อ</h3>
+            ${items.map(item => `
+              <div class="summary-row">
+                <span>${escapeHTML(item.product.name)} × ${item.quantity}</span>
+                <strong>${money(item.product.price * item.quantity)}</strong>
+              </div>
+            `).join("")}
+            <div class="summary-row summary-total">
+              <span>ยอดชำระ</span><span>${money(total)}</span>
+            </div>
+            <p style="font-size:11px;color:var(--muted);margin:12px 0">
+              * ค่าจัดส่งจะแจ้งโดยร้านค้าหากมีค่าใช้จ่ายเพิ่มเติม
+            </p>
+            <button type="submit" class="primary-btn full-btn">
+              <i class="fa-solid fa-check-circle"></i>
+              ยืนยันคำสั่งซื้อ
+            </button>
+            <button type="button" class="secondary-btn full-btn"
+              style="margin-top:9px" onclick="showPage('cart')">
+              กลับไปตะกร้าสินค้า
+            </button>
+          </div>
+        </div>
+      </div>
+    </form>
+  `;
+
+  $("checkoutForm").addEventListener("change", event => {
+    if (event.target.name === "payment") {
+      updatePaymentInfo(event.target.value);
+    }
+  });
+
+  $("checkoutForm").addEventListener("submit", placeOrder);
+
+  updatePaymentInfo("cod");
+}
+
+function getPaymentName(method) {
+  return {
+    cod: "เก็บเงินปลายทาง",
+    bank: "โอนผ่านธนาคาร",
+    qr: "QR Code"
+  }[method] || method;
+}
+
+function updatePaymentInfo(method) {
+  const info = $("paymentInfo");
+  if (!info) return;
+
+  const sellerIds = [...new Set(
+    cartProducts().map(item => item.product.sellerId)
+  )];
+
+  if (method === "cod") {
+    info.innerHTML = `
+      <div class="address-box">
+        <strong>เก็บเงินปลายทาง</strong>
+        <p style="font-size:12px">คุณสามารถชำระเงินกับผู้จัดส่งเมื่อได้รับสินค้า</p>
+      </div>
+    `;
+    return;
+  }
+
+  if (sellerIds.length > 1) {
+    info.innerHTML = `
+      <div class="address-box">
+        <p style="font-size:12px">
+          ตะกร้ามีสินค้าจากหลายร้าน กรุณาแยกคำสั่งซื้อเพื่อชำระเงินให้แต่ละร้าน
+        </p>
+      </div>
+    `;
+    return;
+  }
+
+  const seller = getUserById(sellerIds[0]);
+
+  if (method === "bank") {
+    info.innerHTML = `
+      <div class="address-box">
+        <strong>ข้อมูลบัญชีธนาคารผู้ขาย</strong>
+        <p>ธนาคาร: ${escapeHTML(seller?.bank || "ยังไม่ได้ระบุ")}</p>
+        <p>ชื่อบัญชี: ${escapeHTML(seller?.name || "-")}</p>
+        <p>เลขบัญชี: ${escapeHTML(seller?.bankAccount || "ยังไม่ได้ระบุ")}</p>
+        <p style="font-size:11px;margin-top:8px">
+          กรุณาตรวจสอบข้อมูลบัญชีกับผู้ขายก่อนโอนเงิน
+        </p>
+      </div>
+    `;
+  }
+
+  if (method === "qr") {
+    info.innerHTML = `
+      <div class="qr-preview">
+        <strong>QR Code สำหรับชำระเงิน</strong>
+        ${seller?.qrImage ?
+          `<img src="${escapeHTML(seller.qrImage)}" alt="QR Code">` :
+          `<div style="padding:35px;background:white;margin-top:10px;border-radius:10px">
+            <i class="fa-solid fa-qrcode" style="font-size:65px;color:#a4b9a3"></i>
+            <p>ผู้ขายยังไม่ได้เพิ่ม QR Code</p>
+          </div>`
+        }
+        <p>PromptPay: ${escapeHTML(seller?.promptPay || "ยังไม่ได้ระบุ")}</p>
+        <p>โปรดตรวจสอบชื่อผู้รับเงินและยอดก่อนชำระ</p>
+      </div>
+    `;
+  }
+}
+
+async function placeOrder(event) {
+  event.preventDefault();
+
+  const form = event.currentTarget;
+  const data = new FormData(form);
+
+  const items = cartProducts();
+
+  if (!items.length) {
+    toast("ไม่มีสินค้าในตะกร้า");
+    return;
+  }
+
+  const payment = data.get("payment");
+  const sellerIds = [...new Set(
+    items.map(item => item.product.sellerId)
+  )];
+
+  if (sellerIds.length > 1) {
+    toast("กรุณาแยกสั่งซื้อสินค้าจากแต่ละร้าน");
+    return;
+  }
+
+  const products = getProducts();
+
+  for (const item of items) {
+    const product = products.find(p => p.id === item.productId);
+    if (!product || product.stock < item.quantity) {
+      toast("สินค้า " + item.product.name + " มีจำนวนไม่เพียงพอ");
+      return;
+    }
+  }
+
+  const address = {
+    recipient: data.get("recipient"),
+    phone: data.get("phone"),
+    address: data.get("address"),
+    subdistrict: data.get("subdistrict"),
+    district: data.get("district"),
+    province: data.get("province"),
+    postcode: data.get("postcode")
+  };
+
+  const total = items.reduce(
+    (sum, item) => sum + item.product.price * item.quantity, 0
+  );
+
+  if (!confirm(
+    "ยืนยันคำสั่งซื้อจำนวน " + items.length +
+    " รายการ ยอดรวม " + money(total) + " ?"
+  )) return;
+
+  const submitBtn = form.querySelector("button[type=submit]");
+  submitBtn.disabled = true;
+
+  // หักสต็อกสินค้า (ผ่านฟังก์ชัน decrement_stock ในฐานข้อมูล)
+  const deducted = [];
+  for (const item of items) {
+    const { error } = await supabaseClient.rpc("decrement_stock", {
+      pid: item.productId, qty: item.quantity
+    });
+
+    if (error) {
+      console.error(error);
+      toast("สั่งซื้อไม่สำเร็จ: " + error.message);
+      // คืนสต็อกรายการที่หักไปแล้ว
+      for (const d of deducted) {
+        await supabaseClient.rpc("decrement_stock", {
+          pid: d.productId, qty: -d.quantity
+        });
+      }
+      submitBtn.disabled = false;
+      return;
+    }
+
+    deducted.push(item);
+  }
+
+  const order = {
+    id: uid("SS"),
+    customerId: currentUser.id,
+    customerName: address.recipient,
+    sellerId: sellerIds[0],
+    items: items.map(item => ({
+      productId: item.productId,
+      name: item.product.name,
+      image: item.product.image,
+      price: item.product.price,
+      quantity: item.quantity
+    })),
+    address,
+    payment,
+    paymentName: getPaymentName(payment),
+    total,
+    status: "รอยืนยัน",
+    paymentStatus: payment === "cod" ? "ชำระเมื่อรับสินค้า" : "รอตรวจสอบ",
+    date: new Date().toISOString()
+  };
+
+  if (!await dbOk(
+    supabaseClient.from("orders").insert(toOrder(order)),
+    "บันทึกคำสั่งซื้อไม่สำเร็จ"
+  )) {
+    for (const d of deducted) {
+      await supabaseClient.rpc("decrement_stock", {
+        pid: d.productId, qty: -d.quantity
+      });
+    }
+    submitBtn.disabled = false;
+    return;
+  }
+
+  // บันทึกที่อยู่ในโปรไฟล์
+  if (data.get("saveAddress")) {
+    Object.assign(currentUser, address);
+    delete currentUser.recipient;
+    await dbOk(
+      supabaseClient.from("profiles")
+        .update(toProfile(currentUser)).eq("id", currentUser.id),
+      "บันทึกที่อยู่ไม่สำเร็จ"
+    );
+  }
+
+  save(DB.cart, []);
+  await loadAll();
+  updateNavbar();
+
+  toast("บันทึกคำสั่งซื้อเรียบร้อยแล้ว");
+  showPage("orders");
+}
+
+/* =========================================
+   CUSTOMER ORDER HISTORY
+   ========================================= */
+
+function renderOrders() {
+  const orders = getOrders().filter(
+    order => order.customerId === currentUser.id
+  );
+
+  $("app").innerHTML = `
+    <div class="page-title">
+      <h1><i class="fa-solid fa-box-open"></i> ประวัติคำสั่งซื้อ</h1>
+      <p>ตรวจสอบรายการสินค้าและสถานะการจัดส่งของคุณ</p>
+    </div>
+
+    ${orders.length ? orders.map(order => `
+      <div class="order-card">
+        <div class="order-top">
+          <div>
+            <strong>คำสั่งซื้อ ${escapeHTML(order.id)}</strong>
+            <p style="font-size:10px;color:var(--muted)">
+              ${new Date(order.date).toLocaleString("th-TH")}
+            </p>
+          </div>
+          <span class="status ${order.status === "จัดส่งสำเร็จ" ? "success" : ""}">
+            ${escapeHTML(order.status)}
+          </span>
+        </div>
+
+        ${order.items.map(item => `
+          <div class="order-product">
+            <img src="${escapeHTML(item.image)}">
+            <div>
+              <strong style="font-size:12px">${escapeHTML(item.name)}</strong>
+              <p style="font-size:11px;color:var(--muted)">
+                ${item.quantity} × ${money(item.price)}
+              </p>
+            </div>
+          </div>
+        `).join("")}
+
+        <div class="order-detail">
+          <p><i class="fa-solid fa-location-dot"></i>
+            ${escapeHTML(order.address.recipient)} |
+            ${escapeHTML(order.address.address)}
+            ${escapeHTML(order.address.subdistrict)}
+            ${escapeHTML(order.address.district)}
+            ${escapeHTML(order.address.province)}
+            ${escapeHTML(order.address.postcode)}
+          </p>
+          <p><i class="fa-solid fa-credit-card"></i>
+            ${escapeHTML(order.paymentName)}
+          </p>
+          <p>สถานะชำระเงิน: ${escapeHTML(order.paymentStatus)}</p>
+        </div>
+
+        <div class="order-total">รวม ${money(order.total)}</div>
+        <button class="secondary-btn"
+          onclick="startChat('${order.sellerId}')"
+          style="margin-top:12px">
+          <i class="fa-regular fa-comment"></i> ติดต่อผู้ขาย
+        </button>
+      </div>
+    `).join("") : `
+      <div class="empty-state">
+        <i class="fa-solid fa-box-open"></i>
+        <h3>ยังไม่มีประวัติคำสั่งซื้อ</h3>
+        <p>เมื่อคุณสั่งซื้อสินค้า รายการจะแสดงที่หน้านี้</p>
+        <button class="primary-btn" onclick="showPage('home')">
+          เลือกซื้อสินค้า
+        </button>
+      </div>
+    `}
+  `;
+}
+
+/* =========================================
+   LOGIN AND REGISTER
+   ========================================= */
+
+function renderAuth() {
+  $("app").innerHTML = `
+    <div class="auth-wrapper">
+      <div class="panel">
+        <div style="text-align:center;margin-bottom:22px">
+          <div class="brand-icon" style="margin:auto">
+            <i class="fa-solid fa-seedling"></i>
+          </div>
+          <h2 style="color:var(--green);margin-top:12px">ยินดีต้อนรับสู่ SeedShop</h2>
+          <p style="font-size:12px;color:var(--muted)">
+            ตลาดเมล็ดพันธุ์ออนไลน์
+          </p>
+        </div>
+
+        <div class="auth-tabs">
+          <button class="${authMode === "login" ? "active" : ""}"
+            onclick="setAuthMode('login')">เข้าสู่ระบบ</button>
+          <button class="${authMode === "register" ? "active" : ""}"
+            onclick="setAuthMode('register')">สมัครสมาชิก</button>
+        </div>
+
+        <form id="authForm">
+          ${authMode === "register" ? `
+            <div class="form-group">
+              <label>ชื่อ - นามสกุล / ชื่อร้านค้า</label>
+              <input name="name" required placeholder="กรอกชื่อของคุณ">
+            </div>
+            <div class="form-group">
+              <label>ประเภทบัญชี</label>
+              <select name="role" required>
+                <option value="customer">ลูกค้า (Customer)</option>
+                <option value="seller">ผู้ขาย (Seller)</option>
+              </select>
+            </div>
+          ` : ""}
+
+          <div class="form-group">
+            <label>อีเมล</label>
+            <input name="email" type="email" required placeholder="example@email.com">
+          </div>
+
+          <div class="form-group">
+            <label>รหัสผ่าน</label>
+            <input name="password" type="password" required minlength="6"
+              placeholder="อย่างน้อย 6 ตัวอักษร">
+          </div>
+
+          <button type="submit" class="primary-btn full-btn">
+            ${authMode === "login" ? "เข้าสู่ระบบ" : "สร้างบัญชีสมาชิก"}
+          </button>
+        </form>
+
+        <p class="auth-note">
+          การสมัครสมาชิกแสดงว่าคุณยอมรับเงื่อนไขการใช้งาน
+        </p>
+      </div>
+    </div>
+  `;
+
+  $("authForm").addEventListener("submit", handleAuth);
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  renderAuth();
+}
+
+async function handleAuth(event) {
+  event.preventDefault();
+
+  const form = event.currentTarget;
+  const submitBtn = form.querySelector("button[type=submit]");
+  const data = new FormData(form);
+  const email = data.get("email").trim().toLowerCase();
+  const password = data.get("password");
+
+  submitBtn.disabled = true;
+
+  try {
+    if (authMode === "register") {
+      const name = data.get("name").trim();
+      const role = data.get("role");
+
+      const { data: auth, error } = await supabaseClient.auth.signUp({
+        email, password
+      });
+
+      if (error) {
+        toast(error.message.includes("registered")
+          ? "อีเมลนี้สมัครสมาชิกแล้ว" : error.message);
+        return;
+      }
+
+      if (!auth.session) {
+        toast("กรุณายืนยันอีเมลก่อนเข้าสู่ระบบ (หรือปิด Confirm email ใน Supabase)");
+        return;
+      }
+
+      const profile = {
+        id: auth.user.id, name, email, role,
+        phone: "", address: "", subdistrict: "", district: "",
+        province: "", postcode: "",
+        bank: "", bankAccount: "", promptPay: "", qrImage: ""
+      };
+
+      if (!await dbOk(
+        supabaseClient.from("profiles").insert(toProfile(profile)),
+        "สร้างโปรไฟล์ไม่สำเร็จ"
+      )) return;
+
+      await loginUser(auth.user.id);
+      toast("สมัครสมาชิกเรียบร้อย");
+      showPage(role === "seller" ? "seller" : "home");
+      return;
+    }
+
+    const { data: auth, error } =
+      await supabaseClient.auth.signInWithPassword({ email, password });
+
+    if (error) {
+      toast("อีเมลหรือรหัสผ่านไม่ถูกต้อง");
+      return;
+    }
+
+    if (!await loginUser(auth.user.id)) {
+      toast("ไม่พบโปรไฟล์ของบัญชีนี้");
+      await supabaseClient.auth.signOut();
+      return;
+    }
+
+    toast("เข้าสู่ระบบสำเร็จ");
+    showPage(currentUser.role === "seller" ? "seller" : "home");
+  } finally {
+    submitBtn.disabled = false;
+  }
+}
+
+async function loginUser(userId) {
+  await loadAll();
+  const user = getUserById(userId);
+  if (!user) return false;
+
+  currentUser = user;
+  subscribeChat();
+  updateNavbar();
+  return true;
+}
+
+/* =========================================
+   PROFILE
+   ========================================= */
+
+function renderProfile() {
+  const user = getUserById(currentUser.id) || currentUser;
+
+  $("app").innerHTML = `
+    <div class="page-title">
+      <h1><i class="fa-regular fa-user"></i> โปรไฟล์ของฉัน</h1>
+      <p>จัดการข้อมูลส่วนตัวและที่อยู่สำหรับจัดส่ง</p>
+    </div>
+
+    <div class="profile-layout">
+      <div class="panel profile-sidebar">
+        <div class="avatar">
+          <i class="fa-solid fa-user"></i>
+        </div>
+        <h3>${escapeHTML(user.name)}</h3>
+        <p>${escapeHTML(user.email)}</p>
+        <p style="margin-top:10px">
+          ${user.role === "seller" ? "ผู้ขาย (Seller)" : "ลูกค้า (Customer)"}
+        </p>
+        <p style="margin-top:12px;color:var(--green)">
+          รหัสสมาชิก: ${escapeHTML(user.id)}
+        </p>
+        <button class="danger-btn full-btn"
+          style="margin-top:22px" onclick="logout()">
+          <i class="fa-solid fa-right-from-bracket"></i> ออกจากระบบ
+        </button>
+      </div>
+
+      <div>
+        <form id="profileForm">
+          <div class="panel">
+            <h3>ข้อมูลส่วนตัว</h3>
+            <div class="form-grid">
+              <div class="form-group">
+                <label>ชื่อ / ชื่อร้านค้า</label>
+                <input name="name" required value="${escapeHTML(user.name)}">
+              </div>
+              <div class="form-group">
+                <label>อีเมล</label>
+                <input value="${escapeHTML(user.email)}" disabled>
+              </div>
+              <div class="form-group">
+                <label>เบอร์โทรศัพท์</label>
+                <input name="phone" value="${escapeHTML(user.phone || "")}">
+              </div>
+            </div>
+          </div>
+
+          ${user.role === "customer" ? `
+            <div class="panel">
+              <h3><i class="fa-solid fa-location-dot"></i> ที่อยู่ที่บันทึกไว้</h3>
+              <div class="form-group">
+                <label>ที่อยู่</label>
+                <textarea name="address">${escapeHTML(user.address || "")}</textarea>
+              </div>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label>ตำบล / แขวง</label>
+                  <input name="subdistrict" value="${escapeHTML(user.subdistrict || "")}">
+                </div>
+                <div class="form-group">
+                  <label>อำเภอ / เขต</label>
+                  <input name="district" value="${escapeHTML(user.district || "")}">
+                </div>
+                <div class="form-group">
+                  <label>จังหวัด</label>
+                  <input name="province" value="${escapeHTML(user.province || "")}">
+                </div>
+                <div class="form-group">
+                  <label>รหัสไปรษณีย์</label>
+                  <input name="postcode" maxlength="5" value="${escapeHTML(user.postcode || "")}">
+                </div>
+              </div>
+            </div>
+          ` : `
+            <div class="panel">
+              <h3><i class="fa-solid fa-building-columns"></i> ข้อมูลรับชำระเงินของร้าน</h3>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label>ธนาคาร</label>
+                  <input name="bank" value="${escapeHTML(user.bank || "")}"
+                    placeholder="เช่น ธนาคารกสิกรไทย">
+                </div>
+                <div class="form-group">
+                  <label>เลขบัญชี</label>
+                  <input name="bankAccount" value="${escapeHTML(user.bankAccount || "")}">
+                </div>
+                <div class="form-group">
+                  <label>เบอร์พร้อมเพย์</label>
+                  <input name="promptPay" value="${escapeHTML(user.promptPay || "")}">
+                </div>
+              </div>
+              <div class="form-group">
+                <label>ลิงก์รูป QR Code ของร้าน</label>
+                <input name="qrImage" value="${escapeHTML(user.qrImage || "")}"
+                  placeholder="https://example.com/qr.png">
+                <small style="font-size:10px;color:var(--muted)">
+                  ใส่ URL รูป QR Code ที่ถูกต้องของร้านค้า
+                </small>
+              </div>
+              <div class="form-group">
+                <label>ที่อยู่ร้านค้า</label>
+                <textarea name="address">${escapeHTML(user.address || "")}</textarea>
+              </div>
+            </div>
+          `}
+
+          <button type="submit" class="primary-btn">
+            <i class="fa-solid fa-floppy-disk"></i> บันทึกข้อมูล
+          </button>
+        </form>
+      </div>
+    </div>
+  `;
+
+  $("profileForm").addEventListener("submit", saveProfile);
+}
+
+async function saveProfile(event) {
+  event.preventDefault();
+
+  const data = new FormData(event.currentTarget);
+  const updated = { ...currentUser };
+
+  for (const [key, value] of data.entries()) {
+    updated[key] = value.trim();
+  }
+
+  if (!await dbOk(
+    supabaseClient.from("profiles")
+      .update(toProfile(updated)).eq("id", currentUser.id),
+    "บันทึกโปรไฟล์ไม่สำเร็จ"
+  )) return;
+
+  const index = cache.users.findIndex(u => u.id === currentUser.id);
+  if (index !== -1) cache.users[index] = updated;
+  currentUser = updated;
+
+  toast("บันทึกโปรไฟล์เรียบร้อย");
+  renderProfile();
+}
+
+/* =========================================
+   SELLER DASHBOARD
+   ========================================= */
+
+function renderSeller() {
+  if (!isSeller()) return showPage("auth");
+
+  const products = getProducts().filter(
+    p => p.sellerId === currentUser.id
+  );
+
+  const orders = getOrders().filter(
+    o => o.sellerId === currentUser.id
+  );
+
+  const revenue = orders
+    .filter(o => o.status === "จัดส่งสำเร็จ")
+    .reduce((sum, o) => sum + o.total, 0);
+
+  $("app").innerHTML = `
+    <div class="page-title">
+      <h1><i class="fa-solid fa-store"></i> จัดการร้านค้า</h1>
+      <p>ยินดีต้อนรับ ${escapeHTML(currentUser.name)} จัดการสินค้าและคำสั่งซื้อของคุณ</p>
+    </div>
+
+    <div class="dashboard-stats">
+      <div class="stat-card">
+        <i class="fa-solid fa-box"></i>
+        <strong>${products.length}</strong>
+        <p>สินค้าทั้งหมด</p>
+      </div>
+      <div class="stat-card">
+        <i class="fa-solid fa-cart-shopping"></i>
+        <strong>${orders.length}</strong>
+        <p>คำสั่งซื้อทั้งหมด</p>
+      </div>
+      <div class="stat-card">
+        <i class="fa-solid fa-clock"></i>
+        <strong>${orders.filter(o => o.status === "รอยืนยัน").length}</strong>
+        <p>รอดำเนินการ</p>
+      </div>
+      <div class="stat-card">
+        <i class="fa-solid fa-money-bill-wave"></i>
+        <strong>${money(revenue)}</strong>
+        <p>ยอดขายที่จัดส่งสำเร็จ</p>
+      </div>
+    </div>
+
+    <div class="section-heading">
+      <div>
+        <h2>จัดการสินค้า</h2>
+        <p>เพิ่มสินค้าใหม่และจัดการสต็อกของคุณ</p>
+      </div>
+      <button class="primary-btn" onclick="showAddProduct()">
+        <i class="fa-solid fa-plus"></i> เพิ่มสินค้า
+      </button>
+    </div>
+
+    <div id="sellerProductForm"></div>
+
+    <div class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>สินค้า</th>
+              <th>ราคา</th>
+              <th>คงเหลือ</th>
+              <th>จัดการ</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${products.length ? products.map(p => `
+              <tr>
+                <td>
+                  <img src="${escapeHTML(p.image)}">
+                  ${escapeHTML(p.name)}
+                </td>
+                <td>${money(p.price)}</td>
+                <td>${p.stock}</td>
+                <td>
+                  <button class="secondary-btn"
+                    onclick="editProduct('${p.id}')">แก้ไข</button>
+                  <button class="danger-btn"
+                    onclick="deleteProduct('${p.id}')">ลบ</button>
+                </td>
+              </tr>
+            `).join("") : `
+              <tr><td colspan="4">ยังไม่มีสินค้า กรุณาเพิ่มสินค้า</td></tr>
+            `}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section-heading">
+      <div>
+        <h2>คำสั่งซื้อจากลูกค้า</h2>
+        <p>ตรวจสอบและจัดการออเดอร์ทั้งหมดของร้าน</p>
+      </div>
+      <span>${orders.length} รายการ</span>
+    </div>
+
+    ${orders.length ? orders.map(order => `
+      <div class="order-card">
+        <div class="order-top">
+          <div>
+            <strong>${escapeHTML(order.id)}</strong>
+            <p style="font-size:10px;color:var(--muted)">
+              ${new Date(order.date).toLocaleString("th-TH")}
+            </p>
+          </div>
+          <span class="status">${escapeHTML(order.status)}</span>
+        </div>
+
+        <div class="order-detail">
+          <p><strong>ลูกค้า:</strong> ${escapeHTML(order.customerName)}</p>
+          <p><strong>เบอร์โทร:</strong> ${escapeHTML(order.address.phone)}</p>
+          <p><strong>ที่อยู่:</strong>
+            ${escapeHTML(order.address.address)}
+            ${escapeHTML(order.address.subdistrict)}
+            ${escapeHTML(order.address.district)}
+            ${escapeHTML(order.address.province)}
+            ${escapeHTML(order.address.postcode)}
+          </p>
+          <p><strong>วิธีชำระ:</strong> ${escapeHTML(order.paymentName)}</p>
+          <p><strong>สถานะชำระ:</strong> ${escapeHTML(order.paymentStatus)}</p>
+        </div>
+
+        ${order.items.map(item => `
+          <div class="order-product">
+            <img src="${escapeHTML(item.image)}">
+            <div>
+              <strong style="font-size:12px">${escapeHTML(item.name)}</strong>
+              <p style="font-size:11px;color:var(--muted)">
+                ${item.quantity} × ${money(item.price)}
+              </p>
+            </div>
+          </div>
+        `).join("")}
+
+        <div class="order-total">ยอดรวม ${money(order.total)}</div>
+
+        <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:13px">
+          <select onchange="updateOrderStatus('${order.id}',this.value)">
+            ${["รอยืนยัน","กำลังเตรียมสินค้า","กำลังจัดส่ง","จัดส่งสำเร็จ","ยกเลิก"].map(status => `
+              <option value="${status}" ${order.status === status ? "selected" : ""}>
+                ${status}
+              </option>
+            `).join("")}
+          </select>
+
+          <button class="secondary-btn"
+            onclick="startChat('${order.customerId}')">
+            <i class="fa-regular fa-comment"></i> แชทกับลูกค้า
+          </button>
+        </div>
+      </div>
+    `).join("") : `
+      <div class="empty-state">
+        <i class="fa-solid fa-receipt"></i>
+        <h3>ยังไม่มีคำสั่งซื้อ</h3>
+        <p>เมื่อมีลูกค้าสั่งซื้อ รายการจะแสดงที่นี่</p>
+      </div>
+    `}
+  `;
+}
+
+function showAddProduct(product = null) {
+  if (!isSeller()) return;
+
+  const box = $("sellerProductForm");
+
+  box.innerHTML = `
+    <div class="panel">
+      <h3>${product ? "แก้ไขสินค้า" : "เพิ่มสินค้าใหม่"}</h3>
+
+      <form id="productForm">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>ชื่อสินค้า *</label>
+            <input name="name" required value="${escapeHTML(product?.name || "")}">
+          </div>
+          <div class="form-group">
+            <label>หมวดหมู่ *</label>
+            <select name="category">
+              ${categories.filter(c => c.name !== "ทั้งหมด").map(c => `
+                <option value="${c.name}" ${product?.category === c.name ? "selected" : ""}>
+                  ${c.name}
+                </option>
+              `).join("")}
+            </select>
+          </div>
+          <div class="form-group">
+            <label>ราคา (บาท) *</label>
+            <input name="price" type="number" min="1" required
+              value="${product?.price || ""}">
+          </div>
+          <div class="form-group">
+            <label>จำนวนสินค้าในสต็อก *</label>
+            <input name="stock" type="number" min="0" required
+              value="${product?.stock ?? ""}">
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>รายละเอียดสินค้า</label>
+          <textarea name="description">${escapeHTML(product?.description || "")}</textarea>
+        </div>
+
+        <div class="form-group">
+          <label>URL รูปภาพสินค้า</label>
+          <input name="imageUrl" id="imageUrl"
+            value="${escapeHTML(product?.image || "")}"
+            placeholder="https://example.com/image.jpg">
+        </div>
+
+        <div class="form-group">
+          <label>หรือเลือกรูปภาพจากเครื่อง</label>
+          <input type="file" id="productImageFile" accept="image/*">
+          <img id="productImagePreview"
+            class="image-preview ${product?.image ? "" : "hidden"}"
+            src="${escapeHTML(product?.image || "")}">
+        </div>
+
+        <button class="primary-btn" type="submit">
+          <i class="fa-solid fa-floppy-disk"></i>
+          ${product ? "บันทึกการแก้ไข" : "เพิ่มสินค้า"}
+        </button>
+        <button type="button" class="secondary-btn"
+          onclick="renderSeller()">ยกเลิก</button>
+      </form>
+    </div>
+  `;
+
+  const fileInput = $("productImageFile");
+  let uploadedImage = product?.image || "";
+
+  fileInput.addEventListener("change", () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      toast("กรุณาเลือกไฟล์รูปภาพ");
+      return;
+    }
+
+    if (file.size > 2 * 1024 * 1024) {
+      toast("รูปภาพต้องมีขนาดไม่เกิน 2 MB");
+      fileInput.value = "";
+      return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = event => {
+      uploadedImage = event.target.result;
+      $("productImagePreview").src = uploadedImage;
+      $("productImagePreview").classList.remove("hidden");
+    };
+
+    reader.readAsDataURL(file);
+  });
+
+  $("imageUrl").addEventListener("input", event => {
+    if (event.target.value.trim()) {
+      uploadedImage = event.target.value.trim();
+      $("productImagePreview").src = uploadedImage;
+      $("productImagePreview").classList.remove("hidden");
+    }
+  });
+
+  $("productForm").addEventListener("submit", async event => {
+    event.preventDefault();
+
+    const data = new FormData(event.currentTarget);
+
+    const item = {
+      id: product?.id || uid("P"),
+      name: data.get("name").trim(),
+      category: data.get("category"),
+      price: Number(data.get("price")),
+      stock: Number(data.get("stock")),
+      description: data.get("description").trim(),
+      image: uploadedImage || "https://placehold.co/600x400/e8f5e8/176b43?text=SeedShop",
+      sellerId: currentUser.id,
+      sellerName: currentUser.name
+    };
+
+    if (item.price <= 0 || item.stock < 0) {
+      toast("กรุณาตรวจสอบราคาและจำนวนสินค้า");
+      return;
+    }
+
+    const query = product
+      ? supabaseClient.from("products")
+          .update(toProduct(item)).eq("id", product.id)
+      : supabaseClient.from("products").insert(toProduct(item));
+
+    if (!await dbOk(query, "บันทึกสินค้าไม่สำเร็จ")) return;
+
+    if (product) {
+      const index = cache.products.findIndex(p => p.id === product.id);
+      if (index !== -1) cache.products[index] = item;
+    } else {
+      cache.products.unshift(item);
+    }
+
+    toast(product ? "แก้ไขสินค้าเรียบร้อย" : "เพิ่มสินค้าเรียบร้อย");
+    renderSeller();
+  });
+}
+
+function editProduct(id) {
+  const product = getProducts().find(
+    p => p.id === id && p.sellerId === currentUser.id
+  );
+  if (product) showAddProduct(product);
+}
+
+async function deleteProduct(id) {
+  if (!confirm("ต้องการลบสินค้านี้ใช่หรือไม่?")) return;
+
+  if (!await dbOk(
+    supabaseClient.from("products").delete()
+      .eq("id", id).eq("seller_id", currentUser.id),
+    "ลบสินค้าไม่สำเร็จ"
+  )) return;
+
+  cache.products = cache.products.filter(p => p.id !== id);
+
+  toast("ลบสินค้าเรียบร้อย");
+  renderSeller();
+}
+
+async function updateOrderStatus(id, status) {
+  const order = getOrders().find(
+    o => o.id === id && o.sellerId === currentUser.id
+  );
+
+  if (!order || order.status === status) return;
+
+  const wasCancelled = order.status === "ยกเลิก";
+  const update = { status };
+
+  if (status === "จัดส่งสำเร็จ" && order.payment !== "cod") {
+    update.payment_status = "ผู้ขายยืนยันการรับชำระ";
+  }
+
+  if (!await dbOk(
+    supabaseClient.from("orders").update(update).eq("id", id),
+    "อัปเดตสถานะไม่สำเร็จ"
+  )) return renderSeller();
+
+  order.status = status;
+  if (update.payment_status) order.paymentStatus = update.payment_status;
+
+  // คืนสต็อกเมื่อยกเลิก (ครั้งเดียว)
+  if (status === "ยกเลิก" && !wasCancelled) {
+    for (const item of order.items) {
+      const product = cache.products.find(
+        p => p.id === item.productId && p.sellerId === order.sellerId
+      );
+
+      if (product) {
+        const stock = product.stock + item.quantity;
+        if (await dbOk(
+          supabaseClient.from("products").update({ stock }).eq("id", product.id),
+          "คืนสต็อกไม่สำเร็จ"
+        )) product.stock = stock;
+      }
+    }
+  }
+
+  toast("อัปเดตสถานะคำสั่งซื้อแล้ว");
+  renderSeller();
+}
+
+/* =========================================
+   CHAT SYSTEM
+   ========================================= */
+
+function getChatId(userA, userB) {
+  return [userA, userB].sort().join("__");
+}
+
+function startChat(otherUserId) {
+  if (!requireLogin()) return;
+
+  if (otherUserId === currentUser.id) {
+    toast("ไม่สามารถแชทกับตัวเองได้");
+    return;
+  }
+
+  const other = getUserById(otherUserId);
+
+  if (!other) {
+    toast("ไม่พบข้อมูลผู้ติดต่อ");
+    return;
+  }
+
+  selectedChat = otherUserId;
+  showPage("chat");
+}
+
+function renderChat() {
+  const users = getUsers();
+
+  let contacts;
+
+  if (currentUser.role === "customer") {
+    const sellerIds = new Set(
+      getProducts().map(p => p.sellerId)
+    );
+
+    getOrders()
+      .filter(o => o.customerId === currentUser.id)
+      .forEach(o => sellerIds.add(o.sellerId));
+
+    contacts = users.filter(
+      u => u.role === "seller" && sellerIds.has(u.id)
+    );
+  } else {
+    const customerIds = new Set(
+      getOrders()
+        .filter(o => o.sellerId === currentUser.id)
+        .map(o => o.customerId)
+    );
+
+    getChats().forEach(chat => {
+      if (chat.members?.includes(currentUser.id)) {
+        chat.members.forEach(id => {
+          if (id !== currentUser.id) customerIds.add(id);
+        });
+      }
+    });
+
+    contacts = users.filter(
+      u => u.role === "customer" && customerIds.has(u.id)
+    );
+  }
+
+  if (!selectedChat || !contacts.some(u => u.id === selectedChat)) {
+    selectedChat = contacts[0]?.id || null;
+  }
+
+  const other = getUserById(selectedChat);
+
+  $("app").innerHTML = `
+    <div class="page-title">
+      <h1><i class="fa-regular fa-comments"></i> แชทติดต่อ</h1>
+      <p>พูดคุยสอบถามข้อมูลระหว่างลูกค้าและผู้ขาย</p>
+    </div>
+
+    <div class="chat-layout">
+      <div class="chat-list">
+        <h3>รายชื่อผู้ติดต่อ</h3>
+        ${contacts.length ? contacts.map(user => `
+          <div class="chat-contact"
+            style="${selectedChat === user.id ? "border:1px solid var(--green)" : ""}"
+            onclick="selectChat('${user.id}')">
+            <strong><i class="fa-solid fa-circle-user"></i>
+              ${escapeHTML(user.name)}
+            </strong>
+            <p>${user.role === "seller" ? "ผู้ขาย" : "ลูกค้า"}</p>
+          </div>
+        `).join("") : `
+          <p style="font-size:12px;color:var(--muted);margin-top:15px">
+            ยังไม่มีผู้ติดต่อ
+          </p>
+        `}
+      </div>
+
+      <div class="chat-window">
+        ${other ? `
+          <div class="chat-header">
+            <i class="fa-solid fa-circle-user"></i>
+            ${escapeHTML(other.name)}
+            <small style="font-size:10px;display:block;font-weight:400">
+              ${other.role === "seller" ? "ผู้ขาย" : "ลูกค้า"}
+            </small>
+          </div>
+          <div class="chat-messages" id="chatMessages"></div>
+          <form class="chat-input" id="chatForm">
+            <input name="message" placeholder="พิมพ์ข้อความ..." required autocomplete="off">
+            <button type="submit"><i class="fa-solid fa-paper-plane"></i></button>
+          </form>
+        ` : `
+          <div class="empty-state" style="margin:auto;border:0">
+            <i class="fa-regular fa-comments"></i>
+            <h3>เริ่มต้นพูดคุยกัน</h3>
+            <p>เลือกรายชื่อผู้ติดต่อทางด้านซ้าย</p>
+          </div>
+        `}
+      </div>
+    </div>
+  `;
+
+  if (other) {
+    renderChatMessages();
+
+    $("chatForm").addEventListener("submit", async event => {
+      event.preventDefault();
+
+      const form = event.currentTarget;
+      const message = new FormData(form).get("message").trim();
+
+      if (!message) return;
+
+      const { data: row, error } = await supabaseClient
+        .from("messages")
+        .insert({
+          sender_id: currentUser.id,
+          receiver_id: other.id,
+          message
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error(error);
+        toast("ส่งข้อความไม่สำเร็จ: " + error.message);
+        return;
+      }
+
+      if (!cache.messages.some(m => m.id === row.id)) {
+        cache.messages.push(row);
+      }
+
+      form.reset();
+      renderChatMessages();
+    });
+  }
+}
+
+function selectChat(userId) {
+  selectedChat = userId;
+  renderChat();
+}
+
+function renderChatMessages() {
+  const box = $("chatMessages");
+  if (!box || !selectedChat) return;
+
+  const chatId = getChatId(currentUser.id, selectedChat);
+  const chat = getChats().find(c => c.id === chatId);
+
+  box.innerHTML = chat?.messages?.length
+    ? chat.messages.map(message => `
+      <div class="message ${
+        message.senderId === currentUser.id ? "mine" : "theirs"
+      }">
+        ${escapeHTML(message.message)}
+        <small>${new Date(message.date).toLocaleString("th-TH")}</small>
+      </div>
+    `).join("")
+    : `<p style="text-align:center;color:var(--muted);font-size:12px">
+        เริ่มต้นสนทนาได้เลย
+      </p>`;
+
+  box.scrollTop = box.scrollHeight;
+}
+
+/* =========================================
+   SEARCH
+   ========================================= */
+
+$("searchInput").addEventListener("input", event => {
+  searchText = event.target.value;
+  selectedCategory = "ทั้งหมด";
+
+  if (currentPage !== "home") {
+    showPage("home");
+  } else {
+    renderHome();
+  }
+});
+
+/* =========================================
+   INITIALIZE
+   ========================================= */
+
+async function initialize() {
+  $("app").innerHTML = `<div class="empty-state">
+    <i class="fa-solid fa-seedling"></i><h3>กำลังโหลดข้อมูล...</h3></div>`;
+
+  const { data } = await supabaseClient.auth.getSession();
+
+  if (data.session) {
+    if (!await loginUser(data.session.user.id)) {
+      await supabaseClient.auth.signOut();
+    }
+  } else {
+    await loadAll();
+  }
+
+  updateNavbar();
+  showPage("home");
+}
+
+initialize();

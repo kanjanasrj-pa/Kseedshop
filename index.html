@@ -1,0 +1,70 @@
+
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SeedShop | ตลาดเมล็ดพันธุ์ออนไลน์</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+</head>
+<body>
+
+<header class="topbar">
+  <a href="#" class="brand" onclick="showPage('home');return false">
+    <span class="brand-icon"><i class="fa-solid fa-seedling"></i></span>
+    <span>Seed<span>Shop</span><small>Grow Together</small></span>
+  </a>
+
+  <div class="search-box">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <input id="searchInput" placeholder="ค้นหาเมล็ดพันธุ์ที่คุณต้องการ...">
+  </div>
+
+  <nav class="top-actions">
+    <button onclick="showPage('cart')" class="nav-icon">
+      <i class="fa-solid fa-cart-shopping"></i>
+      <span id="cartCount">0</span>
+    </button>
+    <button onclick="showPage('chat')" class="nav-icon">
+      <i class="fa-regular fa-comment-dots"></i>
+    </button>
+    <button onclick="showPage('orders')" class="nav-icon">
+      <i class="fa-solid fa-box"></i>
+    </button>
+    <button onclick="showPage('profile')" class="nav-icon">
+      <i class="fa-regular fa-user"></i>
+    </button>
+    <button onclick="showPage('auth')" id="loginNav" class="login-nav">เข้าสู่ระบบ</button>
+    <button onclick="logout()" id="logoutNav" class="login-nav hidden">ออกจากระบบ</button>
+  </nav>
+</header>
+
+<div class="announcement">
+  <i class="fa-solid fa-leaf"></i>
+  เมล็ดพันธุ์คุณภาพดี ส่งตรงถึงบ้านคุณ พร้อมเติบโตไปด้วยกัน
+</div>
+
+<main class="container">
+  <div id="app"></div>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="brand footer-brand">
+      <span class="brand-icon"><i class="fa-solid fa-seedling"></i></span>
+      <span>Seed<span>Shop</span><small>Grow Together</small></span>
+    </div>
+    <p>ตลาดซื้อขายเมล็ดพันธุ์เพื่อการเกษตรที่ยั่งยืน</p>
+    <p>© 2026 SeedShop. All rights reserved.</p>
+  </div>
+</footer>
+
+<div id="toast" class="toast"></div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="script.js"></script>
+</body>
+</html>
